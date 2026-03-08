@@ -40,7 +40,7 @@ _GLOBAL_FILE_LOCK = threading.RLock()
 
 
 @register(
-    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.1"
+    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.2"
 )
 class JMBot(Star):
     def __init__(self, context: Context, config: dict):
@@ -126,8 +126,8 @@ class JMBot(Star):
         try:
             await asyncio.sleep(seconds)
             await event.bot.delete_msg(message_id=message_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"schedule recall skipped: {e}")
 
     async def _send_forward_nodes(
         self, event: AstrMessageEvent, nodes_list: list[Node]
@@ -187,8 +187,6 @@ class JMBot(Star):
             if isinstance(event_filter, CommandFilter):
                 event_filter.command_name = self._command_name(key, default)
                 event_filter.alias = self._command_aliases(key, default)
-                if hasattr(event_filter, "_cmpl_cmd_names"):
-                    event_filter._cmpl_cmd_names = None
                 break
 
     def _apply_configured_command_aliases(self):
@@ -332,8 +330,6 @@ class JMBot(Star):
 
     def _parse_chapter_selection_input(self, raw: str, max_index: int) -> list[int]:
         text = raw.strip()
-        if text.startswith("选jm"):
-            text = text[3:].strip()
         if not text:
             return []
 
@@ -576,9 +572,11 @@ class JMBot(Star):
                         if not path:
                             await asyncio.sleep(0.15)
                             continue
-                        return await asyncio.to_thread(
-                            lambda: PILImage.open(path).convert("RGB")
-                        )
+                        def _load_rgb_image(image_path: str):
+                            with PILImage.open(image_path) as img:
+                                return img.convert("RGB")
+
+                        return await asyncio.to_thread(_load_rgb_image, path)
                     except Exception as e:
                         last_error = e
                         await asyncio.sleep(0.15)
@@ -819,11 +817,16 @@ class JMBot(Star):
                     f"本次最多允许下载 {max_chapters} 个章节，请分批发送"
                 )
 
-            selected_photo_ids = [item["photo_id"] for item in selected]
-            summary = "、".join([f"{item['selection_index']}" for item in selected])
             total_selected_pages = sum(
                 int(item.get("page_count", 0) or 0) for item in selected
             )
+            if max_images > 0 and total_selected_pages > max_images:
+                raise RuntimeError(
+                    f"本次共 {total_selected_pages} 张，超过上限 {max_images}，请减少章节后重试"
+                )
+
+            selected_photo_ids = [item["photo_id"] for item in selected]
+            summary = "、".join([f"{item['selection_index']}" for item in selected])
             detail_lines = []
             for item in selected:
                 pcount = int(item.get("page_count", 0) or 0)

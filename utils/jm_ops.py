@@ -24,6 +24,27 @@ _COVER_LOCK_GUARD = threading.RLock()
 _COVER_CACHE_LAST_CLEAN_TS = 0.0
 _OPTION_FILE_LOCK = threading.RLock()
 
+
+def _plugin_data_root() -> Path:
+    return Path("/AstrBot/data/plugin_data/astrbot_plugin_jm_bot").resolve()
+
+
+def _is_safe_runtime_path(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_plugin_data_root())
+        return True
+    except Exception:
+        return False
+
+
+def _purge_cover_download_locks(max_entries: int = 512):
+    with _COVER_LOCK_GUARD:
+        if len(_COVER_DOWNLOAD_LOCKS) <= max_entries:
+            return
+        for key in list(_COVER_DOWNLOAD_LOCKS.keys())[:-max_entries]:
+            _COVER_DOWNLOAD_LOCKS.pop(key, None)
+
+
 _ALLOWED_OPTION_ROOT_KEYS = {
     "version",
     "debug",
@@ -45,6 +66,7 @@ def _get_cover_download_lock(key: str):
     with _COVER_LOCK_GUARD:
         if key not in _COVER_DOWNLOAD_LOCKS:
             _COVER_DOWNLOAD_LOCKS[key] = threading.RLock()
+            _purge_cover_download_locks()
         return _COVER_DOWNLOAD_LOCKS[key]
 
 
@@ -57,6 +79,21 @@ def _is_valid_image_file(path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _future_timeout_seconds(config: dict[str, Any], minimum: int = 15) -> int:
+    request = config.get("request", {}) or {}
+    try:
+        timeout = int(request.get("timeout", 15) or 15)
+    except Exception:
+        timeout = 15
+    try:
+        retries = int(request.get("max_retries", 3) or 3)
+    except Exception:
+        retries = 3
+    retries = max(1, retries)
+    timeout = max(1, timeout)
+    return max(minimum, timeout * retries + 5)
 
 
 def _proxy_map(config: dict[str, Any]) -> dict[str, str]:
@@ -351,7 +388,7 @@ def get_album_page_stats(
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(fetch_one, row) for row in filtered]
-                chapters = [future.result() for future in futures]
+                chapters = [future.result(timeout=_future_timeout_seconds(config, minimum=20)) for future in futures]
         chapters.sort(key=lambda item: int(item.get("selection_index", 10**9)))
         total_pages = sum(int(item.get("page_count", 0) or 0) for item in chapters)
     else:
@@ -881,7 +918,7 @@ def _collect_downloaded_image_paths(
                         pass
 
     if image_paths:
-        return sorted(image_paths)
+        return sorted(image_paths, key=lambda s: [int(x) if x.isdigit() else x.lower() for x in re.findall(r"\d+|\D+", Path(s).name)])
 
     if not album_dir.exists():
         return []
@@ -1163,6 +1200,11 @@ def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
     base_dir = Path(output.get("base_dir", ""))
     cover_dir = Path(output.get("cover_cache_dir", ""))
 
+    if not base_dir or not str(base_dir).strip() or not _is_safe_runtime_path(base_dir):
+        raise ValueError(f"拒绝清理非插件数据目录: {base_dir}")
+    if cover_dir and str(cover_dir).strip() and not _is_safe_runtime_path(cover_dir):
+        raise ValueError(f"拒绝清理非插件数据目录: {cover_dir}")
+
     if base_dir.exists():
         for item in list(base_dir.iterdir()):
             try:
@@ -1228,9 +1270,10 @@ def get_album_brief_pages(config: dict[str, Any], album_id: str) -> int:
 def get_album_total_pages_fallback(config: dict[str, Any], album_id: str) -> int:
     client = _new_client(config, impl="api")
     album = client.get_album_detail(album_id)
+    direct_page_count = int(getattr(album, "page_count", 0) or 0)
     episodes = list(getattr(album, "episode_list", []) or [])
     if not episodes:
-        return 0
+        return direct_page_count
     if len(episodes) == 1:
         pid = str(episodes[0][0])
         photo = client.get_photo_detail(pid, fetch_album=False, fetch_scramble_id=True)
