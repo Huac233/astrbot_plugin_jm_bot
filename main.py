@@ -1,47 +1,46 @@
+import asyncio
+import io
 import json
-import logging
 import re
 import threading
-import io
-import asyncio
-from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from PIL import Image as PILImage, ImageDraw, ImageFont
+from pathlib import Path
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.star.filter.command import CommandFilter
+from PIL import Image as PILImage
+from PIL import ImageDraw, ImageFont
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, register
-from astrbot.api.message_components import Plain, File, Node, Nodes, Image
-from astrbot.core.star.filter.permission import PermissionType
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.permission import PermissionType
 
 from .utils.config_manager import load_config
 from .utils.jm_ops import (
-    search_album,
-    get_search_page,
     cache_cover_image,
-    get_album_page_stats,
-    get_album_total_pages_fallback,
-    download_album_images,
+    clear_domains,
+    clear_plugin_runtime_files,
     download_album_or_photos,
+    download_single_image,
     generate_album_pdf,
     get_album_detail,
+    get_album_page_stats,
+    get_album_total_pages_fallback,
     get_random_album,
+    get_search_page,
+    search_album,
     update_domains,
-    clear_domains,
-    download_single_image,
-    clear_plugin_runtime_files,
 )
 
-logger = logging.getLogger(__name__)
 _GLOBAL_FILE_LOCK = threading.RLock()
 
 
 @register(
-    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "0.2.0"
+    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.1"
 )
 class JMBot(Star):
     def __init__(self, context: Context, config: dict):
@@ -57,6 +56,7 @@ class JMBot(Star):
         self._page_count_cache = {}
         self._search_cache_ttl_seconds = 1800
         self._page_count_cache_ttl_seconds = 21600
+        self._page_count_cache_max_entries = 512
         self._album_locks = {}
         self._lock_guard = threading.RLock()
         self._active_tasks = {}
@@ -130,7 +130,7 @@ class JMBot(Star):
             pass
 
     async def _send_forward_nodes(
-        self, event: AstrMessageEvent, nodes_list: List[Node]
+        self, event: AstrMessageEvent, nodes_list: list[Node]
     ):
         if not nodes_list:
             return
@@ -179,15 +179,6 @@ class JMBot(Star):
         aliases.discard(default)
         return aliases
 
-    def _command_aliases(self, key: str, default: str) -> set[str]:
-        commands = self.config.get("commands", {}) or {}
-        aliases = {default}
-        configured = str(commands.get(key, default) or default).strip()
-        if configured:
-            aliases.add(configured)
-        aliases.discard(default)
-        return aliases
-
     def _apply_command_binding(self, handler_name: str, key: str, default: str):
         handler = getattr(self, handler_name, None)
         if handler is None:
@@ -208,7 +199,7 @@ class JMBot(Star):
         self._apply_command_binding("jm_clear_domain", "clear_domain", "jm清空域名")
 
     @staticmethod
-    def parse_command(message: str) -> List[str]:
+    def parse_command(message: str) -> list[str]:
         cleaned_text = re.sub(r"@\S+\s*", "", message).strip()
         return [p for p in cleaned_text.split(" ") if p][1:]
 
@@ -254,9 +245,9 @@ class JMBot(Star):
                 encoding="utf-8",
             )
 
-    def _resolve_album_id(self, sender_id: str, token: str) -> Optional[str]:
+    def _resolve_album_id(self, session_key: str, token: str) -> str | None:
         cache = self._load_search_cache()
-        user_cache = cache.get(str(sender_id), {}) or {}
+        user_cache = cache.get(str(session_key), {}) or {}
         items = user_cache.get("items", {}) if isinstance(user_cache, dict) else {}
 
         if token in items:
@@ -307,7 +298,7 @@ class JMBot(Star):
                 continue
         return cleaned
 
-    def _format_chapter_lines(self, chapters: List[Dict[str, str]]) -> List[str]:
+    def _format_chapter_lines(self, chapters: list[dict[str, str]]) -> list[str]:
         lines = []
         for chapter in chapters:
             idx = chapter["selection_index"]
@@ -319,7 +310,7 @@ class JMBot(Star):
             lines.append(f"[{idx}] 第{cidx}话 / {pid}{ptext} - {title}")
         return lines
 
-    def _build_chapter_selection_message(self, album: Dict[str, object]) -> str:
+    def _build_chapter_selection_message(self, album: dict[str, object]) -> str:
         threshold = int(
             self.config.get("interaction", {}).get("chapter_fold_threshold", 20)
         )
@@ -339,7 +330,7 @@ class JMBot(Star):
             lines.extend(chapter_lines)
         return "\n".join(lines)
 
-    def _parse_chapter_selection_input(self, raw: str, max_index: int) -> List[int]:
+    def _parse_chapter_selection_input(self, raw: str, max_index: int) -> list[int]:
         text = raw.strip()
         if text.startswith("选jm"):
             text = text[3:].strip()
@@ -369,7 +360,7 @@ class JMBot(Star):
         return result
 
     def _store_pending_selection(
-        self, event: AstrMessageEvent, album: Dict[str, object]
+        self, event: AstrMessageEvent, album: dict[str, object]
     ):
         cache = self._purge_expired_selections(self._load_chapter_selection_cache())
         key = self._get_selection_key(event)
@@ -385,7 +376,7 @@ class JMBot(Star):
         }
         self._save_chapter_selection_cache(cache)
 
-    def _pop_pending_selection(self, event: AstrMessageEvent) -> Optional[dict]:
+    def _pop_pending_selection(self, event: AstrMessageEvent) -> dict | None:
         cache = self._purge_expired_selections(self._load_chapter_selection_cache())
         key = self._get_selection_key(event)
         item = cache.pop(key, None)
@@ -393,7 +384,7 @@ class JMBot(Star):
         return item
 
     async def _send_chapter_selection_prompt(
-        self, event: AstrMessageEvent, album: Dict[str, object]
+        self, event: AstrMessageEvent, album: dict[str, object]
     ):
         threshold = int(
             self.config.get("interaction", {}).get("chapter_fold_threshold", 20)
@@ -432,7 +423,7 @@ class JMBot(Star):
             return
         await self._send_plain(event, base_message)
 
-    def _parse_image_request(self, args: List[str]) -> Optional[Dict[str, int | str]]:
+    def _parse_image_request(self, args: list[str]) -> dict[str, int | str] | None:
         if len(args) < 3:
             return None
 
@@ -452,10 +443,10 @@ class JMBot(Star):
         }
 
     async def _search(self, query: str, page: int):
-        return search_album(self.config, query, page)
+        return await asyncio.to_thread(search_album, self.config, query, page)
 
     async def _search_with_covers(self, query: str, page: int):
-        return get_search_page(self.config, query, page)
+        return await asyncio.to_thread(get_search_page, self.config, query, page)
 
     def _add_number_to_image(
         self, image: PILImage.Image, number: int
@@ -484,7 +475,7 @@ class JMBot(Star):
         )
         return PILImage.alpha_composite(image, txt_layer).convert("RGB")
 
-    def _create_combined_image(self, images: List[PILImage.Image]):
+    def _create_combined_image(self, images: list[PILImage.Image]):
         valid_images = [img for img in images if img is not None]
         if not valid_images:
             return None
@@ -530,8 +521,8 @@ class JMBot(Star):
         return combined
 
     async def _prefetch_selected_chapter_stats(
-        self, album_id: str, selected: List[Dict[str, object]]
-    ) -> List[Dict[str, object]]:
+        self, album_id: str, selected: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
         if not selected:
             return selected
         interaction = self.config.get("interaction", {}) or {}
@@ -564,8 +555,8 @@ class JMBot(Star):
         return merged
 
     async def _download_search_covers(
-        self, items: List[Dict[str, object]]
-    ) -> List[PILImage.Image]:
+        self, items: list[dict[str, object]]
+    ) -> list[PILImage.Image]:
         semaphore = asyncio.Semaphore(
             int(
                 (self.config.get("interaction", {}) or {}).get(
@@ -596,7 +587,29 @@ class JMBot(Star):
 
         return await asyncio.gather(*[one(item) for item in items[:10]])
 
-    async def _fill_page_counts(self, items: List[Dict[str, object]], limit: int = 10):
+    def _purge_page_count_cache(self):
+        now = datetime.now()
+        cleaned = {}
+        for aid, item in list((self._page_count_cache or {}).items()):
+            try:
+                age = (now - datetime.fromisoformat(str(item.get("time")))).total_seconds()
+                if age <= self._page_count_cache_ttl_seconds:
+                    cleaned[aid] = item
+            except Exception:
+                continue
+
+        if len(cleaned) > self._page_count_cache_max_entries:
+            sorted_items = sorted(
+                cleaned.items(),
+                key=lambda kv: str((kv[1] or {}).get("time", "")),
+                reverse=True,
+            )[: self._page_count_cache_max_entries]
+            cleaned = dict(sorted_items)
+
+        self._page_count_cache = cleaned
+
+    async def _fill_page_counts(self, items: list[dict[str, object]], limit: int = 10):
+        self._purge_page_count_cache()
         semaphore = asyncio.Semaphore(
             int(
                 (self.config.get("interaction", {}) or {}).get(
@@ -636,6 +649,7 @@ class JMBot(Star):
                         "pages": pages,
                         "time": datetime.now().isoformat(),
                     }
+                    self._purge_page_count_cache()
                     item["page_count"] = pages
                 except Exception as e:
                     logger.warning(f"fill page count failed for {aid}: {e}")
@@ -655,6 +669,7 @@ class JMBot(Star):
                         "pages": pages,
                         "time": datetime.now().isoformat(),
                     }
+                    self._purge_page_count_cache()
                     item["page_count"] = pages
 
         await asyncio.gather(*[one(item) for item in items[:limit]])
@@ -673,7 +688,8 @@ class JMBot(Star):
         temp_file_path = ""
         try:
             if combined_image_obj is not None:
-                import tempfile, os
+                import os
+                import tempfile
 
                 img_byte_arr = io.BytesIO()
                 combined_image_obj.save(img_byte_arr, "JPEG", quality=85)
@@ -704,11 +720,11 @@ class JMBot(Star):
         event: AstrMessageEvent,
         query: str,
         page: int,
-        search_page: Dict[str, object],
+        search_page: dict[str, object],
     ):
         items = list(search_page.get("items", []) or [])
         cache = self._load_search_cache()
-        user_key = str(event.get_sender_id())
+        user_key = self._get_session_key(event)
         cache[user_key] = {
             "query": query,
             "page": page,
@@ -747,13 +763,13 @@ class JMBot(Star):
         await self._send_search_forward(event, "\n".join(lines), combined)
 
     async def _handle_view_album(self, event: AstrMessageEvent, token: str):
-        album_id = self._resolve_album_id(str(event.get_sender_id()), token)
+        album_id = self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
 
         try:
-            album = get_album_detail(self.config, album_id)
+            album = await asyncio.to_thread(get_album_detail, self.config, album_id)
             if int(album.get("chapter_count", 0)) <= 1:
                 await self._send_plain(
                     event,
@@ -783,13 +799,13 @@ class JMBot(Star):
     async def _handle_select_chapters(
         self, event: AstrMessageEvent, token: str, raw_selection: str
     ):
-        album_id = self._resolve_album_id(str(event.get_sender_id()), token)
+        album_id = self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
 
         try:
-            album = get_album_detail(self.config, album_id)
+            album = await asyncio.to_thread(get_album_detail, self.config, album_id)
             picked = self._parse_chapter_selection_input(
                 raw_selection, len(album["chapters"])
             )
@@ -847,7 +863,7 @@ class JMBot(Star):
     async def _handle_single_image(
         self, event: AstrMessageEvent, token: str, chapter: str, page: int
     ):
-        album_id = self._resolve_album_id(str(event.get_sender_id()), token)
+        album_id = self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
@@ -861,7 +877,7 @@ class JMBot(Star):
         album_lock = None
         try:
             album_lock = self._acquire_album(album_id)
-            ret = download_single_image(self.config, album_id, chapter, page)
+            ret = await asyncio.to_thread(download_single_image, self.config, album_id, chapter, page)
             temp_dir = ret.get("temp_dir")
             caption = f"[{ret['album_id']}] 第{ret['chapter_index']}章 第 {ret['page']}P / 共 {ret['total_pages']}P"
             await self._send_plain(event, caption)
@@ -877,8 +893,8 @@ class JMBot(Star):
 
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    async def _download(self, album_id: str, photo_ids: Optional[List[str]] = None):
-        return download_album_or_photos(self.config, album_id, photo_ids)
+    async def _download(self, album_id: str, photo_ids: list[str] | None = None):
+        return await asyncio.to_thread(download_album_or_photos, self.config, album_id, photo_ids)
 
     async def _build_pdf(self, album_id: str, title: str, image_paths: list):
         async with self._pdf_build_lock:
@@ -890,7 +906,7 @@ class JMBot(Star):
             return result
 
     async def _random(self, query: str):
-        return get_random_album(self.config, query)
+        return await asyncio.to_thread(get_random_album, self.config, query)
 
     @filter.command("看jm", alias={"jm_view"})
     async def jm_unified(self, event: AstrMessageEvent):
@@ -1092,7 +1108,7 @@ class JMBot(Star):
         event.stop_event()
         await self._send_plain(event, "正在检测可用域名，请稍候...")
         try:
-            ret = update_domains(self.config)
+            ret = await asyncio.to_thread(update_domains, self.config)
             ok_items = [x for x in ret if x.get("status") == "ok"]
             fail_items = [x for x in ret if x.get("status") != "ok"]
             if not ret:
@@ -1114,10 +1130,10 @@ class JMBot(Star):
                 top = []
                 for x in ok_items[:20]:
                     d = x.get("domain", "")
-                    l = x.get("latency_ms", "?")
+                    latency_ms = x.get("latency_ms", "?")
                     a = x.get("attempts", 1)
                     v = x.get("verify", "?")
-                    top.append(f"{d} ({l}ms, 第{a}次成功, {v})")
+                    top.append(f"{d} ({latency_ms}ms, 第{a}次成功, {v})")
                 msg.append("可用(已按延迟排序):\n" + "\n".join(top))
             await self._send_plain(event, "\n\n".join(msg))
         except Exception as e:
@@ -1130,7 +1146,7 @@ class JMBot(Star):
         event.should_call_llm(False)
         event.stop_event()
         try:
-            clear_domains(self.config)
+            await asyncio.to_thread(clear_domains, self.config)
             await self._send_plain(
                 event, "已清空配置中的 domain，后续将自动解析可用域名"
             )

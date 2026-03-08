@@ -1,24 +1,23 @@
+import asyncio
+import json
 import os
 import re
-import json
-import time
+import shutil
 import tempfile
 import threading
-import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import yaml
-import gc
-import asyncio
-import logging
-from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from pathlib import Path
+from typing import Any
 
 import jmcomic
-from PIL import Image
 import pikepdf
+import yaml
+from PIL import Image
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+
 _COVER_CACHE_LOCK = threading.RLock()
 _COVER_DOWNLOAD_LOCKS = {}
 _COVER_LOCK_GUARD = threading.RLock()
@@ -36,7 +35,7 @@ _ALLOWED_OPTION_ROOT_KEYS = {
 }
 
 
-def _sanitize_option_data(data: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_option_data(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if k in _ALLOWED_OPTION_ROOT_KEYS}
@@ -60,7 +59,7 @@ def _is_valid_image_file(path: Path) -> bool:
         return False
 
 
-def _proxy_map(config: Dict[str, Any]) -> Dict[str, str]:
+def _proxy_map(config: dict[str, Any]) -> dict[str, str]:
     req = config.get("request", {}) or {}
     enabled = bool(req.get("enabled", True))
     if not enabled:
@@ -71,54 +70,56 @@ def _proxy_map(config: Dict[str, Any]) -> Dict[str, str]:
     return {"http": px, "https": px}
 
 
-def _apply_runtime_proxy(config: Dict[str, Any]):
-    pm = _proxy_map(config)
-    if pm:
-        os.environ["HTTP_PROXY"] = pm["http"]
-        os.environ["HTTPS_PROXY"] = pm["https"]
-        os.environ["http_proxy"] = pm["http"]
-        os.environ["https_proxy"] = pm["https"]
-        jmcomic.JmModuleConfig.DEFAULT_PROXIES = pm
-    else:
-        os.environ.pop("HTTP_PROXY", None)
-        os.environ.pop("HTTPS_PROXY", None)
-        os.environ.pop("http_proxy", None)
-        os.environ.pop("https_proxy", None)
-        jmcomic.JmModuleConfig.DEFAULT_PROXIES = {}
+def _build_option(config: dict[str, Any]) -> jmcomic.JmOption:
+    option_path = _jm_option_path(config)
+    if not option_path.exists():
+        ensure_jm_option_file(config)
+    return jmcomic.JmOption.construct(read_jm_option_data(config))
 
 
-def build_jm_option_data(config: Dict[str, Any]) -> Dict[str, Any]:
+def _new_client(
+    config: dict[str, Any],
+    impl: str = "api",
+    domain_list: list[str] | None = None,
+) -> Any:
+    option = _build_option(config)
+    kwargs: dict[str, Any] = {"impl": impl}
+    if domain_list:
+        kwargs["domain_list"] = domain_list
+    return option.new_jm_client(**kwargs)
+
+
+def _jm_option_path(config: dict[str, Any]) -> Path:
     base_dir = Path(config["output"]["base_dir"])
-    option_file = base_dir.parent / "jm_option.yml"
-    option_data = {}
-    with _OPTION_FILE_LOCK:
-        if option_file.exists():
-            try:
-                with open(option_file, "r", encoding="utf-8") as f:
-                    option_data = _sanitize_option_data(yaml.safe_load(f) or {})
-            except Exception:
-                option_data = {}
+    root_dir = base_dir.parent
+    root_dir.mkdir(parents=True, exist_ok=True)
+    return root_dir / "jm_option.yml"
 
-    option_data = _sanitize_option_data(option_data)
-    option_data.setdefault("version", "2.0")
-    option_data.setdefault("dir_rule", {})
-    option_data["dir_rule"]["base_dir"] = str(base_dir)
-    option_data["dir_rule"]["rule"] = "Bd_Aid_Pindex"
-    option_data.setdefault("client", {})
-    option_data["client"].setdefault("impl", "api")
-    option_data.setdefault("download", {})
-    option_data["download"].setdefault("cache", True)
-    option_data["download"].setdefault("image", {})
-    option_data["download"]["image"].setdefault("decode", True)
-    option_data["download"]["image"].setdefault("suffix", ".jpg")
-    option_data["download"].setdefault("threading", {})
-    option_data["download"]["threading"]["image"] = int(
-        (config.get("download", {}) or {}).get("image_threads", 1) or 1
-    )
-    option_data["download"]["threading"]["photo"] = int(
-        (config.get("download", {}) or {}).get("photo_threads", 1) or 1
-    )
-    option_data.setdefault("log", True)
+
+def _default_jm_option_data(config: dict[str, Any]) -> dict[str, Any]:
+    base_dir = Path(config["output"]["base_dir"])
+    option_data: dict[str, Any] = {
+        "version": "2.0",
+        "dir_rule": {
+            "base_dir": str(base_dir),
+            "rule": "Bd_Aid_Pindex",
+        },
+        "client": {
+            "impl": "api",
+        },
+        "download": {
+            "cache": True,
+            "image": {
+                "decode": True,
+                "suffix": ".jpg",
+            },
+            "threading": {
+                "image": int((config.get("download", {}) or {}).get("image_threads", 1) or 1),
+                "photo": int((config.get("download", {}) or {}).get("photo_threads", 1) or 1),
+            },
+        },
+        "log": True,
+    }
 
     req = config.get("request", {}) or {}
     enabled = bool(req.get("enabled", True))
@@ -127,32 +128,76 @@ def build_jm_option_data(config: Dict[str, Any]) -> Dict[str, Any]:
         option_data["client"]["postman"] = {
             "meta_data": {"proxies": {"http": px, "https": px}}
         }
-    else:
-        if isinstance(option_data.get("client"), dict):
-            option_data["client"].pop("postman", None)
-
     return option_data
 
 
-def load_jm_option_file(config: Dict[str, Any]) -> str:
-    base_dir = Path(config["output"]["base_dir"])
-    root_dir = base_dir.parent
-    root_dir.mkdir(parents=True, exist_ok=True)
-    option_data = build_jm_option_data(config)
-    fd, option_path = tempfile.mkstemp(
-        prefix="jm_option_", suffix=".yml", dir=str(root_dir)
-    )
-    os.close(fd)
-    with open(option_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(option_data, f, allow_unicode=True, sort_keys=False)
+def read_jm_option_data(config: dict[str, Any]) -> dict[str, Any]:
+    option_path = _jm_option_path(config)
+    with _OPTION_FILE_LOCK:
+        if option_path.exists():
+            try:
+                data = _sanitize_option_data(yaml.safe_load(option_path.read_text(encoding="utf-8")) or {})
+            except Exception:
+                data = {}
+        else:
+            data = {}
+
+    merged = _default_jm_option_data(config)
+    for key, value in data.items():
+        if key == "client" and isinstance(value, dict):
+            merged.setdefault("client", {}).update(value)
+        elif key == "download" and isinstance(value, dict):
+            merged.setdefault("download", {}).update(value)
+            if isinstance(value.get("image"), dict):
+                merged["download"].setdefault("image", {}).update(value["image"])
+            if isinstance(value.get("threading"), dict):
+                merged["download"].setdefault("threading", {}).update(value["threading"])
+        elif key == "dir_rule" and isinstance(value, dict):
+            merged.setdefault("dir_rule", {}).update(value)
+        else:
+            merged[key] = value
+
+    merged["dir_rule"]["base_dir"] = str(Path(config["output"]["base_dir"]))
+    merged["dir_rule"]["rule"] = "Bd_Aid_Pindex"
+    merged.setdefault("client", {})
+    merged["client"].setdefault("impl", "api")
+    merged.setdefault("download", {})
+    merged["download"].setdefault("cache", True)
+    merged["download"].setdefault("image", {})
+    merged["download"]["image"].setdefault("decode", True)
+    merged["download"]["image"].setdefault("suffix", ".jpg")
+    merged["download"].setdefault("threading", {})
+    merged["download"]["threading"]["image"] = int((config.get("download", {}) or {}).get("image_threads", 1) or 1)
+    merged["download"]["threading"]["photo"] = int((config.get("download", {}) or {}).get("photo_threads", 1) or 1)
+
+    req = config.get("request", {}) or {}
+    enabled = bool(req.get("enabled", True))
+    px = str(req.get("proxies", "") or "").strip() if enabled else ""
+    if px:
+        merged["client"]["postman"] = {
+            "meta_data": {"proxies": {"http": px, "https": px}}
+        }
+    else:
+        merged["client"].pop("postman", None)
+
+    return _sanitize_option_data(merged)
+
+
+def write_jm_option_data(config: dict[str, Any], data: dict[str, Any]) -> str:
+    option_path = _jm_option_path(config)
+    cleaned = _sanitize_option_data(data)
+    with _OPTION_FILE_LOCK:
+        with open(option_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cleaned, f, allow_unicode=True, sort_keys=False)
     return str(option_path)
 
 
-def _apply_proxy_to_option_file(option_file: str, config: Dict[str, Any]):
-    return None
+def ensure_jm_option_file(config: dict[str, Any]) -> str:
+    data = read_jm_option_data(config)
+    return write_jm_option_data(config, data)
 
 
-def _enforce_max_local_albums(config: Dict[str, Any]):
+def _enforce_max_local_albums(config: dict[str, Any]):
     global _COVER_CACHE_LAST_CLEAN_TS
     output = config.get("output", {}) or {}
     max_local = int(output.get("max_local_albums", 1) or 0)
@@ -178,7 +223,7 @@ def _enforce_max_local_albums(config: Dict[str, Any]):
     )
 
 
-def _enforce_cover_cache_max_files(config: Dict[str, Any], force: bool = False):
+def _enforce_cover_cache_max_files(config: dict[str, Any], force: bool = False):
     global _COVER_CACHE_LAST_CLEAN_TS
     output = config.get("output", {}) or {}
     max_files = int(output.get("cover_cache_max_files", 200) or 0)
@@ -206,7 +251,7 @@ def _enforce_cover_cache_max_files(config: Dict[str, Any], force: bool = False):
     _COVER_CACHE_LAST_CLEAN_TS = now
 
 
-def _enforce_max_local_chapters(config: Dict[str, Any], album_id: str):
+def _enforce_max_local_chapters(config: dict[str, Any], album_id: str):
     global _COVER_CACHE_LAST_CLEAN_TS
     output = config.get("output", {}) or {}
     max_local = int(output.get("max_local_chapters", 0) or 0)
@@ -229,13 +274,8 @@ def _enforce_max_local_chapters(config: Dict[str, Any], album_id: str):
         )
 
 
-def _get_photo_detail_by_chapter(config: Dict[str, Any], album_id: str, chapter: str):
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+def _get_photo_detail_by_chapter(config: dict[str, Any], album_id: str, chapter: str):
+    client = _new_client(config, impl="api")
     album = client.get_album_detail(album_id)
 
     photo = None
@@ -267,17 +307,12 @@ def _get_photo_detail_by_chapter(config: Dict[str, Any], album_id: str, chapter:
 
 
 def get_album_page_stats(
-    config: Dict[str, Any],
+    config: dict[str, Any],
     album_id: str,
-    selected_photo_ids: Optional[List[str]] = None,
+    selected_photo_ids: list[str] | None = None,
     concurrency: int = 4,
-) -> Dict[str, Any]:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+) -> dict[str, Any]:
+    client = _new_client(config, impl="api")
     album = client.get_album_detail(album_id)
 
     selected_set = {str(pid) for pid in (selected_photo_ids or []) if str(pid).strip()}
@@ -298,7 +333,8 @@ def get_album_page_stats(
 
         def fetch_one(row):
             idx, photo_id, chapter_index, chapter_title = row
-            photo = client.get_photo_detail(
+            local_client = _new_client(config, impl="api")
+            photo = local_client.get_photo_detail(
                 photo_id, fetch_album=False, fetch_scramble_id=True
             )
             pages = len(photo)
@@ -358,20 +394,20 @@ def encrypt_pdf(input_pdf: str, output_pdf: str, password: str):
 
 
 def images_to_pdf_chunks(
-    image_paths: List[str],
+    image_paths: list[str],
     output_dir: Path,
     pdf_name: str,
     pdf_max_pages: int,
     pdf_password: str,
     jpeg_quality: int,
-) -> List[str]:
+) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     total_pages = len(image_paths)
     if total_pages == 0:
         return []
 
     chunk_size = pdf_max_pages if pdf_max_pages > 0 else total_pages
-    pdf_files: List[str] = []
+    pdf_files: list[str] = []
 
     for idx, start in enumerate(range(0, total_pages, chunk_size), 1):
         chunk = image_paths[start : start + chunk_size]
@@ -380,7 +416,7 @@ def images_to_pdf_chunks(
             f"{pdf_name}-{idx}.pdf" if total_pages > chunk_size else f"{pdf_name}.pdf"
         )
 
-        temp_page_files: List[Path] = []
+        temp_page_files: list[Path] = []
         try:
             for page_no, image_path in enumerate(chunk, 1):
                 page_pdf = output_dir / f".__page_{idx}_{page_no}.pdf"
@@ -418,12 +454,12 @@ def images_to_pdf_chunks(
     return pdf_files
 
 
-def build_album_image_list(base_dir: Path, album_id: str) -> List[str]:
+def build_album_image_list(base_dir: Path, album_id: str) -> list[str]:
     album_dir = base_dir / str(album_id)
     if not album_dir.exists():
         return []
 
-    image_paths: List[str] = []
+    image_paths: list[str] = []
 
     for chapter in sorted(
         album_dir.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else 10**9
@@ -444,7 +480,7 @@ def build_album_image_list(base_dir: Path, album_id: str) -> List[str]:
     return image_paths
 
 
-def find_existing_pdfs_in_album(album_dir: Path) -> List[str]:
+def find_existing_pdfs_in_album(album_dir: Path) -> list[str]:
     if not album_dir.exists() or not album_dir.is_dir():
         return []
     return sorted(
@@ -456,7 +492,7 @@ def find_existing_pdfs_in_album(album_dir: Path) -> List[str]:
     )
 
 
-def _collect_download_stats(dler, image_paths: List[str]) -> Dict[str, int]:
+def _collect_download_stats(dler, image_paths: list[str]) -> dict[str, int]:
     success_images = len(image_paths)
     failed_images = len(getattr(dler, "download_failed_image", []) or [])
 
@@ -484,12 +520,8 @@ def _collect_download_stats(dler, image_paths: List[str]) -> Dict[str, int]:
     }
 
 
-def download_album_images(config: Dict[str, Any], album_id: str) -> Dict[str, Any]:
-    _apply_runtime_proxy(config)
+def download_album_images(config: dict[str, Any], album_id: str) -> dict[str, Any]:
     out_base = Path(config["output"]["base_dir"])
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
     existing = find_existing_pdfs_in_album(out_base / str(album_id))
     if existing:
         return {
@@ -501,7 +533,7 @@ def download_album_images(config: Dict[str, Any], album_id: str) -> Dict[str, An
 
     _enforce_max_local_albums(config)
 
-    option = jmcomic.JmOption.from_file(option_file)
+    option = jmcomic.JmOption.construct(read_jm_option_data(config))
     album, dler = jmcomic.download_album(album_id, option, check_exception=False)
 
     real_id = str(album.album_id)
@@ -523,8 +555,8 @@ def download_album_images(config: Dict[str, Any], album_id: str) -> Dict[str, An
 
 
 def generate_album_pdf(
-    config: Dict[str, Any], album_id: str, title: str, image_paths: List[str]
-) -> List[str]:
+    config: dict[str, Any], album_id: str, title: str, image_paths: list[str]
+) -> list[str]:
     out_base = Path(config["output"]["base_dir"]) / str(album_id)
     return images_to_pdf_chunks(
         image_paths=image_paths,
@@ -536,7 +568,7 @@ def generate_album_pdf(
     )
 
 
-def download_album_to_pdf(config: Dict[str, Any], album_id: str) -> Dict[str, Any]:
+def download_album_to_pdf(config: dict[str, Any], album_id: str) -> dict[str, Any]:
     prepared = download_album_images(config, album_id)
     if prepared.get("cached"):
         return prepared
@@ -549,14 +581,9 @@ def download_album_to_pdf(config: Dict[str, Any], album_id: str) -> Dict[str, An
 
 
 def search_album(
-    config: Dict[str, Any], query: str, page: int = 1
-) -> List[Dict[str, Any]]:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+    config: dict[str, Any], query: str, page: int = 1
+) -> list[dict[str, Any]]:
+    client = _new_client(config, impl="api")
 
     tags = re.sub(r"[，,]+", " ", query).strip()
     result = client.search_site(search_query=tags, page=page)
@@ -569,23 +596,18 @@ def search_album(
 
 
 def get_random_album(
-    config: Dict[str, Any], query: str = ""
-) -> Optional[Dict[str, Any]]:
-    _apply_runtime_proxy(config)
+    config: dict[str, Any], query: str = ""
+) -> dict[str, Any] | None:
     import random
 
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+    client = _new_client(config, impl="api")
 
     tags = re.sub(r"[，,]+", " ", query).strip() if query else ""
 
     cache_file = Path(config["cache"]["random_cache_file"])
     cache_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cache_data: Dict[str, Any] = {}
+    cache_data: dict[str, Any] = {}
     if cache_file.exists():
         try:
             cache_data = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
@@ -641,10 +663,8 @@ def get_random_album(
     return {"id": str(aid), "title": str(title), "page": p, "max_page": max_page}
 
 
-def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
+def update_domains(config: dict[str, Any]) -> list[dict[str, Any]]:
+    ensure_jm_option_file(config)
 
     req = config.get("request", {}) or {}
     timeout = int(req.get("timeout", 15) or 15)
@@ -687,7 +707,7 @@ def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"get_html_domain_all_via_github failed: {e}")
 
-    cleaned: List[str] = []
+    cleaned: list[str] = []
     for d in sorted(domain_set):
         d = d.strip().split("/")[0]
         if d.startswith("t.me"):
@@ -695,9 +715,7 @@ def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         if d and "." in d:
             cleaned.append(d)
 
-    option = jmcomic.JmOption.from_file(option_file)
-
-    def probe_domain(domain: str) -> Dict[str, Any]:
+    def probe_domain(domain: str) -> dict[str, Any]:
         best_latency_ms = None
         last_error = ""
 
@@ -733,7 +751,7 @@ def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         for i in range(probe_attempts):
             t0 = time.perf_counter()
             try:
-                client = option.new_jm_client(impl="html", domain_list=[domain])
+                client = _new_client(config, impl="html", domain_list=[domain])
                 client.get_album_detail("123456")
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 best_latency_ms = (
@@ -760,7 +778,7 @@ def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "error": last_error[:200],
         }
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     if cleaned:
         workers = min(8, max(1, len(cleaned)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -790,32 +808,27 @@ def update_domains(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
     ok_domains = [r["domain"] for r in ok_results]
 
-    with open(option_file, "r", encoding="utf-8") as f:
-        data = _sanitize_option_data(yaml.safe_load(f) or {})
+    data = read_jm_option_data(config)
     data.setdefault("client", {})
-    data["client"].setdefault("domain", {})
+    data.setdefault("client", {}).setdefault("domain", {})
 
     # 仅当本次探测有可用域名时才覆盖；否则保留旧配置，避免“更新后全空”
     if ok_domains:
         data["client"]["domain"]["html"] = ok_domains
-        with open(option_file, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        write_jm_option_data(config, data)
 
     return results
 
 
-def clear_domains(config: Dict[str, Any]):
-    option_file = load_jm_option_file(config)
-    with open(option_file, "r", encoding="utf-8") as f:
-        data = _sanitize_option_data(yaml.safe_load(f) or {})
-    if "client" in data and "domain" in data["client"]:
-        del data["client"]["domain"]
-        data["client"]["impl"] = "api"
-    with open(option_file, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+def clear_domains(config: dict[str, Any]):
+    data = read_jm_option_data(config)
+    client = data.setdefault("client", {})
+    client.pop("domain", None)
+    client["impl"] = "api"
+    write_jm_option_data(config, data)
 
 
-def get_album_detail(config: Dict[str, Any], album_id: str) -> Dict[str, Any]:
+def get_album_detail(config: dict[str, Any], album_id: str) -> dict[str, Any]:
     stats = get_album_page_stats(config, album_id)
     chapters = []
     for item in stats.get("chapters", []) or []:
@@ -842,10 +855,10 @@ def get_album_detail(config: Dict[str, Any], album_id: str) -> Dict[str, Any]:
 
 
 def _collect_downloaded_image_paths(
-    base_dir: Path, album_id: str, downloaders: List[Any]
-) -> List[str]:
+    base_dir: Path, album_id: str, downloaders: list[Any]
+) -> list[str]:
     album_dir = base_dir / str(album_id)
-    image_paths: List[str] = []
+    image_paths: list[str] = []
     seen = set()
 
     for dler in downloaders or []:
@@ -896,14 +909,14 @@ def _collect_downloaded_image_paths(
 
 
 def build_selected_image_list(
-    base_dir: Path, album_id: str, selected_chapter_dirs: List[str]
-) -> List[str]:
+    base_dir: Path, album_id: str, selected_chapter_dirs: list[str]
+) -> list[str]:
     album_dir = base_dir / str(album_id)
     if not album_dir.exists():
         return []
 
     selected = {str(pid) for pid in selected_chapter_dirs}
-    image_paths: List[str] = []
+    image_paths: list[str] = []
     for chapter in sorted(
         album_dir.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else 10**9
     ):
@@ -924,18 +937,14 @@ def build_selected_image_list(
 
 
 def download_album_or_photos(
-    config: Dict[str, Any], album_id: str, photo_ids: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    _apply_runtime_proxy(config)
+    config: dict[str, Any], album_id: str, photo_ids: list[str] | None = None
+) -> dict[str, Any]:
     out_base = Path(config["output"]["base_dir"])
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
     selected_photo_ids = [str(pid) for pid in (photo_ids or []) if str(pid).strip()]
 
     _enforce_max_local_albums(config)
 
-    option = jmcomic.JmOption.from_file(option_file)
+    option = _build_option(config)
 
     if selected_photo_ids:
         photos = []
@@ -1006,13 +1015,9 @@ def download_album_or_photos(
 
 
 def download_single_image(
-    config: Dict[str, Any], album_id: str, chapter: str, page: int
-) -> Dict[str, Any]:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
+    config: dict[str, Any], album_id: str, chapter: str, page: int
+) -> dict[str, Any]:
+    option = _build_option(config)
     album, photo = _get_photo_detail_by_chapter(config, album_id, chapter)
 
     total_pages = len(photo)
@@ -1063,14 +1068,9 @@ def download_single_image(
 
 
 def get_search_page(
-    config: Dict[str, Any], query: str, page: int = 1
-) -> Dict[str, Any]:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+    config: dict[str, Any], query: str, page: int = 1
+) -> dict[str, Any]:
+    client = _new_client(config, impl="api")
 
     tags = re.sub(r"[，,]+", " ", query).strip()
     result = client.search_site(search_query=tags, page=page)
@@ -1093,7 +1093,7 @@ def get_search_page(
 
 
 async def cache_cover_image(
-    config: Dict[str, Any], album_id: str, size: str = "_3x4"
+    config: dict[str, Any], album_id: str, size: str = "_3x4"
 ) -> str:
     cover_dir = Path((config.get("output", {}) or {}).get("cover_cache_dir", ""))
     cover_dir.mkdir(parents=True, exist_ok=True)
@@ -1120,11 +1120,7 @@ async def cache_cover_image(
             if target.exists():
                 target.unlink(missing_ok=True)
 
-            _apply_runtime_proxy(config)
-            option_file = load_jm_option_file(config)
-            _apply_proxy_to_option_file(option_file, config)
-            option = jmcomic.JmOption.from_file(option_file)
-            client = option.new_jm_client(impl="api")
+            client = _new_client(config, impl="api")
 
             temp_target = target.with_name(
                 f"{target.stem}.part.{os.getpid()}.{threading.get_ident()}{target.suffix}"
@@ -1152,7 +1148,7 @@ async def cache_cover_image(
     return await asyncio.to_thread(_download_cover_sync)
 
 
-def clear_plugin_runtime_files(config: Dict[str, Any]) -> Dict[str, int]:
+def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
     removed = {
         "download_dirs": 0,
         "download_files": 0,
@@ -1202,13 +1198,6 @@ def clear_plugin_runtime_files(config: Dict[str, Any]) -> Dict[str, int]:
             pass
 
     root_dir = base_dir.parent if str(base_dir) else None
-    option_file = root_dir / "jm_option.yml" if root_dir else None
-    if option_file and option_file.exists():
-        try:
-            option_file.unlink(missing_ok=True)
-            removed["option_files"] += 1
-        except Exception:
-            pass
 
     if root_dir and root_dir.exists():
         for item in list(root_dir.iterdir()):
@@ -1230,22 +1219,14 @@ def clear_plugin_runtime_files(config: Dict[str, Any]) -> Dict[str, int]:
     return removed
 
 
-def get_album_brief_pages(config: Dict[str, Any], album_id: str) -> int:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+def get_album_brief_pages(config: dict[str, Any], album_id: str) -> int:
+    client = _new_client(config, impl="api")
     album = client.get_album_detail(album_id)
     return int(getattr(album, "page_count", 0) or 0)
 
 
-def get_album_total_pages_fallback(config: Dict[str, Any], album_id: str) -> int:
-    _apply_runtime_proxy(config)
-    option_file = load_jm_option_file(config)
-    _apply_proxy_to_option_file(option_file, config)
-    option = jmcomic.JmOption.from_file(option_file)
-    client = option.new_jm_client(impl="api")
+def get_album_total_pages_fallback(config: dict[str, Any], album_id: str) -> int:
+    client = _new_client(config, impl="api")
     album = client.get_album_detail(album_id)
     episodes = list(getattr(album, "episode_list", []) or [])
     if not episodes:

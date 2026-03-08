@@ -1,14 +1,16 @@
-import logging
-import yaml
+import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any
 from urllib.parse import urlparse
+
 import aiohttp
+import yaml
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+from astrbot.api.star import StarTools
 
 
-def parse_proxy_config(proxy_str: str) -> Dict[str, Any]:
+def parse_proxy_config(proxy_str: str) -> dict[str, Any]:
     if not proxy_str:
         return {}
 
@@ -27,7 +29,29 @@ def parse_proxy_config(proxy_str: str) -> Dict[str, Any]:
     return {"url": proxy_url, "auth": auth}
 
 
-def _set_nested(d: Dict[str, Any], path: list[str], value: Any):
+
+
+def _load_schema_defaults() -> dict[str, Any]:
+    schema_path = Path(__file__).parent.parent / "_conf_schema.json"
+    if not schema_path.exists():
+        return {}
+    try:
+        data = json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"读取 _conf_schema.json 失败: {e}")
+        return {}
+
+    defaults: dict[str, Any] = {}
+    for key, meta in data.items():
+        if isinstance(meta, dict) and "default" in meta:
+            defaults[key] = meta["default"]
+    return defaults
+
+
+def _schema_default(schema_defaults: dict[str, Any], key: str, fallback: Any) -> Any:
+    return schema_defaults.get(key, fallback)
+
+def _set_nested(d: dict[str, Any], path: list[str], value: Any):
     cur = d
     for p in path[:-1]:
         cur = cur.setdefault(p, {})
@@ -35,26 +59,25 @@ def _set_nested(d: Dict[str, Any], path: list[str], value: Any):
 
 
 def load_config(
-    config: dict, config_path: Optional[Union[str, Path]] = None
-) -> Dict[str, Any]:
-    yaml_path = (
-        Path(config_path)
-        if config_path
-        else Path(__file__).parent.parent / "config.yaml"
-    )
+    config: dict, config_path: str | Path | None = None, persist: bool = False
+) -> dict[str, Any]:
+    data_dir = StarTools.get_data_dir("astrbot_plugin_jm_bot")
+    yaml_path = Path(config_path) if config_path else data_dir / "config.yaml"
+    schema_defaults = _load_schema_defaults()
 
-    yaml_config: Dict[str, Any] = {}
+    yaml_config: dict[str, Any] = {}
+    created_default_file = False
     if yaml_path.exists():
-        with open(yaml_path, "r", encoding="utf-8") as f:
+        with open(yaml_path, encoding="utf-8") as f:
             yaml_config = yaml.safe_load(f) or {}
     else:
-        logger.warning("配置文件不存在，创建默认配置")
+        logger.warning("配置文件不存在，准备创建默认配置")
+        created_default_file = True
 
     int_fields = {
         "request_timeout": ["request", "timeout"],
         "request_max_retries": ["request", "max_retries"],
         "output_pdf_max_pages": ["output", "pdf_max_pages"],
-        "output_batch_size": ["output", "batch_size"],
         "output_jpeg_quality": ["output", "jpeg_quality"],
         "output_max_local_albums": ["output", "max_local_albums"],
         "chapter_fold_threshold": ["interaction", "chapter_fold_threshold"],
@@ -101,29 +124,25 @@ def load_config(
             _set_nested(yaml_config, str_fields[key], str(val))
 
     request = yaml_config.setdefault("request", {})
-    request.setdefault("enabled", True)
+    request.setdefault("enabled", bool(_schema_default(schema_defaults, "request_enabled", False)))
     if request.get("enabled", True):
         request["proxy"] = parse_proxy_config(request.get("proxies", ""))
     else:
         request["proxy"] = {}
 
     output = yaml_config.setdefault("output", {})
-    base = Path(
-        output.get(
-            "base_dir", "/AstrBot/data/plugin_data/astrbot_plugin_jm_bot/download"
-        )
-    )
+    base = Path(output.get("base_dir") or _schema_default(schema_defaults, "output_base_dir", str(data_dir / "download")))
     output["base_dir"] = str(base)
     # 清理旧字段，避免误导
     output.pop("image_dir", None)
     output.pop("pdf_dir", None)
-    output.setdefault("pdf_max_pages", 200)
-    output.setdefault("jpeg_quality", 85)
-    output.setdefault("pdf_password", "")
-    output.setdefault("max_local_albums", 1)
-    output.setdefault("max_local_chapters", 0)
-    output.setdefault("cover_cache_dir", str(base.parent / "cover_cache"))
-    output.setdefault("cover_cache_max_files", 200)
+    output.setdefault("pdf_max_pages", int(_schema_default(schema_defaults, "output_pdf_max_pages", "150")))
+    output.setdefault("jpeg_quality", int(_schema_default(schema_defaults, "output_jpeg_quality", "85")))
+    output.setdefault("pdf_password", str(_schema_default(schema_defaults, "output_pdf_password", "")))
+    output.setdefault("max_local_albums", int(_schema_default(schema_defaults, "output_max_local_albums", "5")))
+    output.setdefault("max_local_chapters", int(_schema_default(schema_defaults, "output_max_local_chapters", "0")))
+    output.setdefault("cover_cache_dir", str(_schema_default(schema_defaults, "output_cover_cache_dir", str(data_dir / "cover_cache"))))
+    output.setdefault("cover_cache_max_files", int(_schema_default(schema_defaults, "output_cover_cache_max_files", "100")))
 
     try:
         jpeg_quality = int(output.get("jpeg_quality", 85))
@@ -159,12 +178,12 @@ def load_config(
     cache.setdefault("cache_root_dir", str(cache_root))
 
     features = yaml_config.setdefault("features", {})
-    features.setdefault("open_random_search", False)
+    features.setdefault("open_random_search", bool(_schema_default(schema_defaults, "features_open_random_search", True)))
     features.setdefault("auto_find_jm", False)
 
     download = yaml_config.setdefault("download", {})
-    download.setdefault("image_threads", 1)
-    download.setdefault("photo_threads", 1)
+    download.setdefault("image_threads", int(_schema_default(schema_defaults, "download_image_threads", "8")))
+    download.setdefault("photo_threads", int(_schema_default(schema_defaults, "download_photo_threads", "8")))
 
     try:
         image_threads = int(download.get("image_threads", 1))
@@ -179,14 +198,14 @@ def load_config(
     download["photo_threads"] = max(1, min(8, photo_threads))
 
     interaction = yaml_config.setdefault("interaction", {})
-    interaction.setdefault("chapter_fold_threshold", 20)
-    interaction.setdefault("max_download_images", 120)
-    interaction.setdefault("max_download_chapters", 3)
-    interaction.setdefault("search_page_count_threads", 3)
-    interaction.setdefault("search_cover_threads", 5)
-    interaction.setdefault("chapter_detail_threads", 4)
+    interaction.setdefault("chapter_fold_threshold", int(_schema_default(schema_defaults, "chapter_fold_threshold", "20")))
+    interaction.setdefault("max_download_images", int(_schema_default(schema_defaults, "interaction_max_download_images", "400")))
+    interaction.setdefault("max_download_chapters", int(_schema_default(schema_defaults, "interaction_max_download_chapters", "3")))
+    interaction.setdefault("search_page_count_threads", int(_schema_default(schema_defaults, "interaction_search_page_count_threads", "10")))
+    interaction.setdefault("search_cover_threads", int(_schema_default(schema_defaults, "interaction_search_cover_threads", "10")))
+    interaction.setdefault("chapter_detail_threads", int(_schema_default(schema_defaults, "interaction_chapter_detail_threads", "10")))
     interaction.setdefault("chapter_selection_ttl", 86400)
-    interaction.setdefault("auto_recall_seconds", 60)
+    interaction.setdefault("auto_recall_seconds", int(_schema_default(schema_defaults, "interaction_auto_recall_seconds", "60")))
 
     try:
         fold_threshold = int(interaction.get("chapter_fold_threshold", 20))
@@ -252,7 +271,11 @@ def load_config(
     )
     Path(output["cover_cache_dir"]).mkdir(parents=True, exist_ok=True)
 
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(yaml_config, f, allow_unicode=True, sort_keys=False)
+    if persist or created_default_file:
+        try:
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(yaml_config, f, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            logger.warning(f"写入配置文件失败: {e}")
 
     return yaml_config

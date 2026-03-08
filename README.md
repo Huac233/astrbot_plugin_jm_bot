@@ -1,105 +1,157 @@
 # astrbot_plugin_jm_bot
 
-## 所有内容均由gpt-5.4生成 不保证功能的可用性 请自行参考
+## 所有内容均由gpt-5.4生成不保证功能的可用性请自行参考
 
-适配 AstrBot 的 JM 漫画搜索、选章、单图提取与 PDF 发送插件。
+适配 AstrBot 的 JM 漫画搜索、选章下载、单图提取与 PDF 发送插件。
 
-这个插件围绕 `搜jm` / `看jm` 两条主链路设计：
-- `搜jm` 负责搜索、封面缩略图预览、结果缓存、页数补全与翻页提示
-- `看jm` 负责查看详情、章节选择、多章节下载、单图提取与 PDF 发送
+> 当前版本：`v0.1.1`
 
-同时，插件针对 AstrBot 场景做了几轮实战优化：
-- 命令执行后阻断 LLM 误触发
-- 转发消息与纯文本消息支持自动撤回
-- `jm更新域名`、`jm清空域名` 默认管理员执行，可在行为管理中调整
-- 搜索结果支持封面拼图与转发消息发送
-- 多章节详情支持受控并发补全章节标题和页数
-- PDF 生成移入后台线程，并通过串行锁避免阻塞 AstrBot 主事件处理
-- 下载目录、缓存目录、临时目录支持统一清理，便于发布后长期运行
+## 功能概览
 
-## 项目地址
+- `搜jm [关键词] [页码]`
+  - 搜索 JM 漫画
+  - 支持封面缩略图拼图预览
+  - 支持结果缓存与翻页提示
+  - 支持补全前若干条作品总页数
+- `看jm [序号或id]`
+  - 查看作品详情
+  - 单章节作品可直接下载
+  - 多章节作品支持选章后下载
+- `看jm [序号或id] [章节编号/范围]`
+  - 支持单章、多章、范围下载，例如 `看jm 1 1,3,5-7`
+- `看jm [序号或id] [章节] P[页码]`
+  - 提取指定章节中的单张图片
+- `随机jm [关键词]`
+  - 随机返回符合关键词的作品
+- `jm更新域名`
+  - 更新可用 HTML 域名
+- `jm清空域名`
+  - 清空持久化域名配置并恢复 API 模式
 
-- GitHub: `https://github.com/Huac233/astrbot_plugin_jm_bot`
+## 特性
 
-## 致谢与参考
-
-本项目的设计与落地过程参考了以下项目与资料：
-
-- AstrBot 插件模板：`https://github.com/Soulter/helloworld`
-- AstrBot EH 插件：`https://github.com/drdon1234/astrbot_plugin_ehentai_bot`
-- ShowMeJM：`https://github.com/exneverbur/ShowMeJM`
-- JMComic-Crawler-Python：`https://github.com/hect0x7/JMComic-Crawler-Python`
-- AstrBot 开发文档：`https://docs.astrbot.app/dev/star/guides/listen-message-event.html`
-
-其中，搜索结果封面预览、转发消息发送体验、命令行为管理适配等思路，重点参考了 AstrBot 插件生态的现有实现；JM 下载与接口调用能力则主要建立在 `jmcomic` 生态之上。
-
-## 功能特性
-
-### 1. 搜索与预览
-
-- 支持 `搜jm [关键词] [页码]`
-- 搜索结果以转发消息发送
-- 支持封面缩略图拼图预览
-- 支持前若干条结果补全作品总页数 `[XXP]`
-- 支持每个用户独立搜索缓存，后续可直接 `看jm [序号]`
-- 支持翻页提示，如 `搜jm 关键词 2`
-
-### 2. 查看与下载
-
-- 支持 `看jm [序号或id]`
-- 单章节作品可直接下载
-- 多章节作品会先返回章节列表，再选择章节下载
-- 支持 `看jm [序号或id] [章节]`
-- 支持多章节选择，例如：`看jm 1 1,3,5-7`
-- 选中多个章节时，会并发补全章节标题和页数信息
-
-### 3. 单图提取
-
-- 支持 `看jm [序号或id] [章节] P[页码]`
-- 仅提取指定章节中的单张图片
-- 不走整章 PDF 打包，更适合快速取图
-
-### 4. 域名管理
-
-- 支持 `jm更新域名`
-- 支持 `jm清空域名`
-- 默认管理员权限执行
-- 可在 AstrBot 行为管理中改为所有人可执行
-
-### 5. 自动撤回
-
-- 纯文本消息支持自动撤回
-- 转发消息支持自动撤回（在支持 `message_id` 的发送链路下）
-- 图片、PDF、文件默认不撤回
-- 可通过配置控制秒数，默认 60 秒，填 `0` 关闭
-
-### 6. 缓存与清理
-
-- 搜索缓存支持 TTL
+- 适配 AstrBot 命令事件模型
+- 命令执行时阻断 LLM 误触发
+- 搜索缓存按会话隔离，避免群聊串号
 - 章节选择缓存支持 TTL
-- 页数补全支持内存缓存
-- 封面缓存支持最大文件数淘汰
-- 支持统一清理下载目录、封面缓存、缓存文件、运行时临时文件
+- 页数补全缓存支持 TTL 与容量上限
+- 搜索封面缓存支持最大文件数淘汰
+- PDF 生成走后台线程，降低主事件线程阻塞风险
+- `jm_option.yml` 改为稳定持久化结构，避免多线程覆盖与临时文件泄漏
+- 文本消息与转发消息支持自动撤回配置
+- 域名更新与清空支持持久保留
 
-## 安装方式
+## 安装
 
-### 方式一：通过 GitHub 仓库安装
+### 方式一：仓库安装
 
-在 AstrBot WebUI 插件市场中，使用仓库地址安装：
+在 AstrBot WebUI 插件市场中使用仓库地址安装：
 
 ```text
 https://github.com/Huac233/astrbot_plugin_jm_bot
 ```
 
-### 方式二：本地插件目录安装
+### 方式二：本地目录安装
 
-将本项目放入 AstrBot 的插件目录后，重载插件即可。
-
-推荐目录：
+将项目放入 AstrBot 插件目录：
 
 ```text
 /AstrBot/data/plugins/astrbot_plugin_jm_bot
 ```
+
+## 依赖
+
+请以 `requirements.txt` 为准：
+
+- `jmcomic>=2.5.29`
+- `pillow>=10.0.0`
+- `pikepdf>=9.0.0`
+- `PyYAML>=6.0.1`
+- `aiofiles>=23.2.1`
+- `curl-cffi>=0.6.0`
+
+> `aiohttp` 由 AstrBot 运行环境提供，本插件未单独声明。
+
+## 指令说明
+
+### 搜索
+
+```text
+搜jm 萝莉
+搜jm 韩漫 2
+搜jm 萝莉 +无修正 -AI
+```
+
+### 查看与下载
+
+```text
+看jm 1
+看jm 1356854
+看jm 1 2
+看jm 1 1,3,5-7
+```
+
+### 单图提取
+
+```text
+看jm 8 2 P5
+```
+
+### 随机
+
+```text
+随机jm
+随机jm 萝莉
+```
+
+### 域名管理
+
+```text
+jm更新域名
+jm清空域名
+```
+
+## 配置说明
+
+推荐优先通过 AstrBot WebUI 插件配置面板修改配置。
+插件会读取 `_conf_schema.json` 中声明的默认值，并在缺失配置时补齐运行时默认结构。
+
+### 请求相关
+
+- `request_enabled`
+- `request_proxies`
+- `request_timeout`
+- `request_max_retries`
+
+### 输出相关
+
+- `output_base_dir`
+- `output_pdf_max_pages`
+- `output_jpeg_quality`
+- `output_pdf_password`
+- `output_max_local_albums`
+- `output_max_local_chapters`
+- `output_cover_cache_dir`
+- `output_cover_cache_max_files`
+
+### 下载并发
+
+- `download_image_threads`
+- `download_photo_threads`
+
+### 交互相关
+
+- `interaction_search_page_count_threads`
+- `interaction_search_cover_threads`
+- `interaction_chapter_detail_threads`
+- `chapter_fold_threshold`
+- `interaction_max_download_images`
+- `interaction_max_download_chapters`
+- `interaction_auto_recall_seconds`
+
+### 功能开关
+
+- `features_open_random_search`
 
 ## Docker 使用注意事项
 
@@ -127,213 +179,12 @@ https://github.com/Huac233/astrbot_plugin_jm_bot
 
 如果这两个路径在不同容器里不能互相访问，那么插件即使已经成功生成文件，消息侧也仍然可能拿不到文件。
 
-## 依赖
+## 开发参考
 
-插件依赖写在 `requirements.txt` 中，当前仓库内声明的运行依赖包括：
-
-- `jmcomic`
-- `Pillow`
-- `pikepdf`
-- `PyYAML`
-- `aiofiles`
-- `curl-cffi`
-
-运行依赖请以 `requirements.txt` 为准。
-
-如果你的运行环境无法自动安装依赖，请手动安装。
-
-## 使用说明
-
-### 指令总览
-
-- `搜jm [关键词] [页码]`
-- `看jm [序号或id]`
-- `看jm [序号或id] [章节编号/范围]`
-- `看jm [序号或id] [章节] P[页码]`
-- `随机jm [关键词]`
-- `jm更新域名`
-- `jm清空域名`
-- `jm清理缓存`
-
-### 搜索示例
-
-```text
-搜jm 萝莉
-搜jm 韩漫 2
-搜jm 萝莉 +无修正 -AI
-```
-
-### 查看与下载示例
-
-```text
-看jm 1
-看jm 1356854
-看jm 1 2
-看jm 1 1,3,5-7
-```
-
-### 单图示例
-
-```text
-看jm 8 2 P5
-```
-
-### 随机示例
-
-```text
-随机jm
-随机jm 萝莉
-```
-
-## 配置说明
-
-插件启动后会自动整理 `config.yaml`。推荐优先通过 AstrBot WebUI 的插件配置面板修改配置。
-
-### 请求相关
-
-- `request.enabled`
-  - 是否启用代理
-- `request.proxies`
-  - 代理地址，例如：`http://mihomo:7890`
-- `request.timeout`
-  - 请求超时秒数
-- `request.max_retries`
-  - 请求重试次数
-
-### 输出相关
-
-- `output.base_dir`
-  - 下载输出目录
-- `output.pdf_max_pages`
-  - 单个 PDF 最大页数，超过会自动拆卷
-- `output.jpeg_quality`
-  - 图片转 PDF 时的图片质量
-- `output.pdf_password`
-  - PDF 密码，可空
-- `output.max_local_albums`
-  - 本地最多保留漫画目录数
-- `output.max_local_chapters`
-  - 单本漫画最多保留章节目录数
-- `output.cover_cache_dir`
-  - 搜索封面缓存目录
-- `output.cover_cache_max_files`
-  - 封面缓存最大保留文件数
-
-### 下载并发
-
-- `download.image_threads`
-  - 单章节图片下载并发
-- `download.photo_threads`
-  - 整本/多章节下载并发
-
-### 交互相关
-
-- `interaction.chapter_fold_threshold`
-  - 章节列表折叠阈值
-- `interaction.max_download_images`
-  - 单次允许下载的最大图片数
-- `interaction.max_download_chapters`
-  - 单次允许下载的最大章节数
-- `interaction.search_page_count_threads`
-  - 搜索结果补 P 数并发
-- `interaction.search_cover_threads`
-  - 搜索页封面下载并发
-- `interaction.chapter_detail_threads`
-  - 多章节详情补全并发
-- `interaction.chapter_selection_ttl`
-  - 章节选择缓存保留秒数
-- `interaction.auto_recall_seconds`
-  - 纯文本 / 转发消息自动撤回秒数，默认 60，`0` 为关闭
-
-### 功能开关
-
-- `features.open_random_search`
-  - 是否启用 `随机jm`
-
-### 可改命令别名
-
-以下命令支持通过配置改主命令名：
-
-- `commands.search`
-- `commands.view`
-- `commands.random`
-- `commands.update_domain`
-- `commands.clear_domain`
-
-插件启动时会将配置中的命令名绑定到运行时命令，同时保留默认命令作为别名，方便平滑迁移与行为管理调整。
-
-## 行为管理说明
-
-- `jm更新域名`
-- `jm清空域名`
-
-这两条命令默认使用管理员权限过滤。
-
-如果你希望开放给普通用户执行，可以直接在 AstrBot 的行为管理中调整，不需要修改代码。
-
-## 目录与缓存说明
-
-默认情况下，插件会使用类似下面的目录结构：
-
-```text
-plugin_data/
-└── astrbot_plugin_jm_bot/
-    ├── download/
-    │   └── [album_id]/
-    ├── cover_cache/
-    ├── search_cache.json
-    ├── chapter_selection_cache.json
-    ├── jm_max_page.json
-    └── jm_option.yml
-```
-
-`jm清理缓存` 会尽量清理以下内容：
-
-- 下载目录中的漫画目录
-- 下载目录中的散文件
-- 封面缓存文件
-- 搜索缓存 / 随机缓存 / 章节选择缓存
-- `jm_option.yml`
-- 插件根目录下遗留的临时目录与中间文件
-
-这部分已经按长期运行场景补过一轮，适合作为发布版使用。
-
-## 代理说明
-
-如果你的环境需要代理访问 JM，请在配置中填写：
-
-```text
-request.proxies = http://mihomo:7890
-```
-
-插件会同时把代理注入到运行环境和 `jmcomic` 选项文件中。
-
-## 已知说明
-
-- 搜索结果页补 P 数本质上仍需要额外接口调用；并发可调，但调太高会增加站点和代理压力
-- PDF 生成已经移入后台线程，并通过串行锁避免同时大量构建导致 AstrBot 卡顿
-- 图片、PDF、文件默认不参与自动撤回，这是有意保留的安全边界
-
-## 发布建议
-
-发布前建议至少手动验证下面几项：
-
-- `搜jm 萝莉 1`
-- `看jm [序号]`
-- `看jm [序号] [章节]`
-- `看jm [序号] [章节] P[页码]`
-- `随机jm`
-- `jm更新域名`
-- `jm清空域名`
-- `jm清理缓存`
-
-同时确认：
-
-- 命令执行后不会误触发 LLM
-- 转发消息可正常发送
-- 自动撤回按配置生效
-- 多章节详情补全正常
-- 清理命令能清掉运行时残留目录与文件
+- AstrBot 插件开发文档：`https://docs.astrbot.app/dev/star/plugin-new.html`
+- AstrBot 插件模板：`https://github.com/Soulter/helloworld`
+- AstrBot EH 插件：`https://github.com/drdon1234/astrbot_plugin_ehentai_bot`
+- JMComic-Crawler-Python：`https://github.com/hect0x7/JMComic-Crawler-Python`
 
 ## 免责声明
 
