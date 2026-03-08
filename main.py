@@ -36,11 +36,9 @@ from .utils.jm_ops import (
     update_domains,
 )
 
-_GLOBAL_FILE_LOCK = threading.RLock()
-
 
 @register(
-    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.2"
+    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.3"
 )
 class JMBot(Star):
     def __init__(self, context: Context, config: dict):
@@ -58,7 +56,9 @@ class JMBot(Star):
         self._page_count_cache_ttl_seconds = 21600
         self._page_count_cache_max_entries = 512
         self._album_locks = {}
-        self._lock_guard = threading.RLock()
+        self._lock_guard = threading.Lock()
+        self._search_cache_lock = asyncio.Lock()
+        self._page_count_cache_lock = asyncio.Lock()
         self._active_tasks = {}
         self._pdf_build_lock = asyncio.Lock()
         self._apply_configured_command_aliases()
@@ -70,24 +70,24 @@ class JMBot(Star):
             return f"group:{group_id}:user:{sender_id}"
         return f"private:{sender_id}"
 
-    def _get_named_lock(self, bucket: dict, key: str) -> threading.RLock:
+    def _get_named_async_lock(self, bucket: dict, key: str) -> asyncio.Lock:
         with self._lock_guard:
             if key not in bucket:
-                bucket[key] = threading.RLock()
+                bucket[key] = asyncio.Lock()
             return bucket[key]
 
-    def _acquire_session(self, session_key: str):
-        lock = self._get_named_lock(self._session_locks, session_key)
-        ok = lock.acquire(blocking=False)
-        if not ok:
+    async def _acquire_session(self, session_key: str):
+        lock = self._get_named_async_lock(self._session_locks, session_key)
+        if lock.locked():
             raise RuntimeError("当前会话已有 JM 任务在运行，请稍候再试")
+        await lock.acquire()
         return lock
 
-    def _acquire_album(self, album_id: str):
-        lock = self._get_named_lock(self._album_locks, f"album:{album_id}")
-        ok = lock.acquire(blocking=False)
-        if not ok:
+    async def _acquire_album(self, album_id: str):
+        lock = self._get_named_async_lock(self._album_locks, f"album:{album_id}")
+        if lock.locked():
             raise RuntimeError(f"漫画 {album_id} 正在被其他任务处理，请稍候再试")
+        await lock.acquire()
         return lock
 
     def _set_active_task(self, session_key: str, action: str, target: str = ""):
@@ -128,6 +128,14 @@ class JMBot(Star):
             await event.bot.delete_msg(message_id=message_id)
         except Exception as e:
             logger.debug(f"schedule recall skipped: {e}")
+
+    def _is_forward_risk_control_error(self, error: Exception) -> bool:
+        message = str(error or "")
+        return (
+            "ActionFailed" in message
+            and "retcode=1200" in message
+            and "发送转发消息" in message
+        )
 
     async def _send_forward_nodes(
         self, event: AstrMessageEvent, nodes_list: list[Node]
@@ -219,32 +227,36 @@ class JMBot(Star):
                 continue
         return cleaned
 
-    def _load_search_cache(self) -> dict:
-        with _GLOBAL_FILE_LOCK:
+    async def _load_search_cache(self) -> dict:
+        async with self._search_cache_lock:
             if not self.search_cache_file.exists():
                 return {}
             try:
-                data = json.loads(
-                    self.search_cache_file.read_text(encoding="utf-8") or "{}"
+                raw = await asyncio.to_thread(
+                    self.search_cache_file.read_text, encoding="utf-8"
                 )
+                data = json.loads(raw or "{}")
             except Exception:
                 return {}
-        cleaned = self._purge_search_cache(data)
-        if cleaned != data:
-            self._save_search_cache(cleaned)
-        return cleaned
+            cleaned = self._purge_search_cache(data)
+            if cleaned != data:
+                await asyncio.to_thread(
+                    self.search_cache_file.write_text,
+                    json.dumps(cleaned, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return cleaned
 
-    def _save_search_cache(self, data: dict):
-        with _GLOBAL_FILE_LOCK:
-            self.search_cache_file.write_text(
-                json.dumps(
-                    self._purge_search_cache(data), ensure_ascii=False, indent=2
-                ),
+    async def _save_search_cache(self, data: dict):
+        async with self._search_cache_lock:
+            await asyncio.to_thread(
+                self.search_cache_file.write_text,
+                json.dumps(self._purge_search_cache(data), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
-    def _resolve_album_id(self, session_key: str, token: str) -> str | None:
-        cache = self._load_search_cache()
+    async def _resolve_album_id(self, session_key: str, token: str) -> str | None:
+        cache = await self._load_search_cache()
         user_cache = cache.get(str(session_key), {}) or {}
         items = user_cache.get("items", {}) if isinstance(user_cache, dict) else {}
 
@@ -257,7 +269,7 @@ class JMBot(Star):
         return None
 
     def _load_chapter_selection_cache(self) -> dict:
-        with _GLOBAL_FILE_LOCK:
+        with self._lock_guard:
             if not self.chapter_selection_cache_file.exists():
                 return {}
             try:
@@ -269,7 +281,7 @@ class JMBot(Star):
                 return {}
 
     def _save_chapter_selection_cache(self, data: dict):
-        with _GLOBAL_FILE_LOCK:
+        with self._lock_guard:
             self.chapter_selection_cache_file.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -585,29 +597,32 @@ class JMBot(Star):
 
         return await asyncio.gather(*[one(item) for item in items[:10]])
 
-    def _purge_page_count_cache(self):
-        now = datetime.now()
-        cleaned = {}
-        for aid, item in list((self._page_count_cache or {}).items()):
-            try:
-                age = (now - datetime.fromisoformat(str(item.get("time")))).total_seconds()
-                if age <= self._page_count_cache_ttl_seconds:
-                    cleaned[aid] = item
-            except Exception:
-                continue
+    async def _purge_page_count_cache(self):
+        async with self._page_count_cache_lock:
+            now = datetime.now()
+            cleaned = {}
+            for aid, item in (self._page_count_cache or {}).items():
+                try:
+                    age = (
+                        now - datetime.fromisoformat(str(item.get("time")))
+                    ).total_seconds()
+                    if age <= self._page_count_cache_ttl_seconds:
+                        cleaned[aid] = item
+                except Exception:
+                    continue
 
-        if len(cleaned) > self._page_count_cache_max_entries:
-            sorted_items = sorted(
-                cleaned.items(),
-                key=lambda kv: str((kv[1] or {}).get("time", "")),
-                reverse=True,
-            )[: self._page_count_cache_max_entries]
-            cleaned = dict(sorted_items)
+            if len(cleaned) > self._page_count_cache_max_entries:
+                sorted_items = sorted(
+                    cleaned.items(),
+                    key=lambda kv: str((kv[1] or {}).get("time", "")),
+                    reverse=True,
+                )[: self._page_count_cache_max_entries]
+                cleaned = dict(sorted_items)
 
-        self._page_count_cache = cleaned
+            self._page_count_cache = cleaned
 
     async def _fill_page_counts(self, items: list[dict[str, object]], limit: int = 10):
-        self._purge_page_count_cache()
+        await self._purge_page_count_cache()
         semaphore = asyncio.Semaphore(
             int(
                 (self.config.get("interaction", {}) or {}).get(
@@ -619,7 +634,8 @@ class JMBot(Star):
 
         async def one(item):
             aid = str(item.get("id", ""))
-            cached = self._page_count_cache.get(aid)
+            async with self._page_count_cache_lock:
+                cached = self._page_count_cache.get(aid)
             if isinstance(cached, dict):
                 try:
                     age = (
@@ -643,11 +659,12 @@ class JMBot(Star):
                             )
                             or 0
                         )
-                    self._page_count_cache[aid] = {
-                        "pages": pages,
-                        "time": datetime.now().isoformat(),
-                    }
-                    self._purge_page_count_cache()
+                    async with self._page_count_cache_lock:
+                        self._page_count_cache[aid] = {
+                            "pages": pages,
+                            "time": datetime.now().isoformat(),
+                        }
+                    await self._purge_page_count_cache()
                     item["page_count"] = pages
                 except Exception as e:
                     logger.warning(f"fill page count failed for {aid}: {e}")
@@ -663,11 +680,12 @@ class JMBot(Star):
                             f"fill page count fallback failed for {aid}: {e2}"
                         )
                         pages = 0
-                    self._page_count_cache[aid] = {
-                        "pages": pages,
-                        "time": datetime.now().isoformat(),
-                    }
-                    self._purge_page_count_cache()
+                    async with self._page_count_cache_lock:
+                        self._page_count_cache[aid] = {
+                            "pages": pages,
+                            "time": datetime.now().isoformat(),
+                        }
+                    await self._purge_page_count_cache()
                     item["page_count"] = pages
 
         await asyncio.gather(*[one(item) for item in items[:limit]])
@@ -705,7 +723,26 @@ class JMBot(Star):
                 Node(name=sender_name, uin=sender_id, content=[Plain(result_text)])
             )
             if nodes_list:
-                await self._send_forward_nodes(event, nodes_list)
+                try:
+                    await self._send_forward_nodes(event, nodes_list)
+                except Exception as e:
+                    if not self._is_forward_risk_control_error(e):
+                        raise
+                    logger.warning(
+                        f"search forward blocked by QQ risk control, fallback to text-only forward: {e}"
+                    )
+                    fallback_text = (
+                        result_text
+                        + "\n\n提示：当前群聊缩略图可能受 QQ 群政策风控影响，已自动降级为纯文本转发。若需缩略图，请使用私聊查看。"
+                    )
+                    fallback_nodes = [
+                        Node(
+                            name=sender_name,
+                            uin=sender_id,
+                            content=[Plain(fallback_text)],
+                        )
+                    ]
+                    await self._send_forward_nodes(event, fallback_nodes)
         finally:
             if temp_file_path:
                 import os
@@ -721,7 +758,7 @@ class JMBot(Star):
         search_page: dict[str, object],
     ):
         items = list(search_page.get("items", []) or [])
-        cache = self._load_search_cache()
+        cache = await self._load_search_cache()
         user_key = self._get_session_key(event)
         cache[user_key] = {
             "query": query,
@@ -731,7 +768,7 @@ class JMBot(Star):
         }
         for idx, item in enumerate(items[:10], 1):
             cache[user_key]["items"][str(idx)] = str(item.get("id", ""))
-        self._save_search_cache(cache)
+        await self._save_search_cache(cache)
 
         await self._fill_page_counts(items, limit=min(10, len(items)))
         covers = await self._download_search_covers(items)
@@ -761,7 +798,7 @@ class JMBot(Star):
         await self._send_search_forward(event, "\n".join(lines), combined)
 
     async def _handle_view_album(self, event: AstrMessageEvent, token: str):
-        album_id = self._resolve_album_id(self._get_session_key(event), token)
+        album_id = await self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
@@ -774,7 +811,7 @@ class JMBot(Star):
                     f"这本只有 1 个章节，直接开始下载: {album_id}\n"
                     + self._runtime_hint(),
                 )
-                album_lock = self._acquire_album(album_id)
+                album_lock = await self._acquire_album(album_id)
                 try:
                     ret = await self._download(album_id)
                 finally:
@@ -797,7 +834,7 @@ class JMBot(Star):
     async def _handle_select_chapters(
         self, event: AstrMessageEvent, token: str, raw_selection: str
     ):
-        album_id = self._resolve_album_id(self._get_session_key(event), token)
+        album_id = await self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
@@ -847,7 +884,7 @@ class JMBot(Star):
                 message += preview_text + "\n"
             message += self._runtime_hint()
             await self._send_plain(event, message)
-            album_lock = self._acquire_album(album["album_id"])
+            album_lock = await self._acquire_album(album["album_id"])
             try:
                 ret = await self._download(album["album_id"], selected_photo_ids)
             finally:
@@ -866,7 +903,7 @@ class JMBot(Star):
     async def _handle_single_image(
         self, event: AstrMessageEvent, token: str, chapter: str, page: int
     ):
-        album_id = self._resolve_album_id(self._get_session_key(event), token)
+        album_id = await self._resolve_album_id(self._get_session_key(event), token)
         if not album_id:
             await self._send_plain(event, "未找到对应编号，请先查jm，或直接填漫画id")
             return
@@ -879,7 +916,7 @@ class JMBot(Star):
         temp_dir = None
         album_lock = None
         try:
-            album_lock = self._acquire_album(album_id)
+            album_lock = await self._acquire_album(album_id)
             ret = await asyncio.to_thread(download_single_image, self.config, album_id, chapter, page)
             temp_dir = ret.get("temp_dir")
             caption = f"[{ret['album_id']}] 第{ret['chapter_index']}章 第 {ret['page']}P / 共 {ret['total_pages']}P"
@@ -918,7 +955,7 @@ class JMBot(Star):
         session_key = self._get_session_key(event)
         session_lock = None
         try:
-            session_lock = self._acquire_session(session_key)
+            session_lock = await self._acquire_session(session_key)
             self._set_active_task(session_key, "看jm")
             args = self.parse_command(event.message_str)
             if not args:
@@ -1045,7 +1082,7 @@ class JMBot(Star):
         session_key = self._get_session_key(event)
         session_lock = None
         try:
-            session_lock = self._acquire_session(session_key)
+            session_lock = await self._acquire_session(session_key)
             self._set_active_task(session_key, "搜jm")
             args = self.parse_command(event.message_str)
             if not args:

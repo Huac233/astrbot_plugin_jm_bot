@@ -17,6 +17,7 @@ import yaml
 from PIL import Image
 
 from astrbot.api import logger
+from astrbot.api.star import StarTools
 
 _COVER_CACHE_LOCK = threading.RLock()
 _COVER_DOWNLOAD_LOCKS = {}
@@ -26,7 +27,7 @@ _OPTION_FILE_LOCK = threading.RLock()
 
 
 def _plugin_data_root() -> Path:
-    return Path("/AstrBot/data/plugin_data/astrbot_plugin_jm_bot").resolve()
+    return StarTools.get_data_dir("astrbot_plugin_jm_bot").resolve()
 
 
 def _is_safe_runtime_path(path: Path) -> bool:
@@ -387,8 +388,26 @@ def get_album_page_stats(
             chapters = [fetch_one(row) for row in filtered]
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(fetch_one, row) for row in filtered]
-                chapters = [future.result(timeout=_future_timeout_seconds(config, minimum=20)) for future in futures]
+                future_map = {executor.submit(fetch_one, row): row for row in filtered}
+                chapters = []
+                timeout = _future_timeout_seconds(config, minimum=20)
+                for future, row in future_map.items():
+                    idx, photo_id, chapter_index, chapter_title = row
+                    try:
+                        chapters.append(future.result(timeout=timeout))
+                    except Exception as e:
+                        logger.warning(
+                            f"chapter detail fetch failed: album={album_id}, photo={photo_id}, error={e}"
+                        )
+                        chapters.append(
+                            {
+                                "selection_index": idx,
+                                "photo_id": photo_id,
+                                "chapter_index": chapter_index,
+                                "chapter_title": chapter_title.strip(),
+                                "page_count": 0,
+                            }
+                        )
         chapters.sort(key=lambda item: int(item.get("selection_index", 10**9)))
         total_pages = sum(int(item.get("page_count", 0) or 0) for item in chapters)
     else:
@@ -1170,7 +1189,17 @@ async def cache_cover_image(
                 client.download_album_cover(album_id, str(temp_target), size=size)
                 if not _is_valid_image_file(temp_target):
                     raise RuntimeError(f"cover download incomplete: {temp_target}")
-                os.replace(temp_target, target)
+                last_error = None
+                for _ in range(3):
+                    try:
+                        os.replace(temp_target, target)
+                        last_error = None
+                        break
+                    except PermissionError as e:
+                        last_error = e
+                        time.sleep(0.2)
+                if last_error is not None:
+                    raise last_error
             except Exception as e:
                 logger.warning(
                     f"cover download failed: album={album_id}, path={target}, error={e}"
@@ -1214,8 +1243,8 @@ def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
                 elif item.is_file():
                     item.unlink(missing_ok=True)
                     removed["download_files"] += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"clear runtime download item failed: {item}, error={e}")
 
     if cover_dir.exists():
         for item in list(cover_dir.iterdir()):
@@ -1223,8 +1252,8 @@ def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
                 if item.is_file():
                     item.unlink(missing_ok=True)
                     removed["cover_files"] += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"clear runtime cover item failed: {item}, error={e}")
 
     for key in (
         "search_cache_file",
@@ -1236,8 +1265,8 @@ def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
             if path.exists() and path.is_file():
                 path.unlink(missing_ok=True)
                 removed["cache_files"] += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"clear runtime cache file failed: {path}, error={e}")
 
     root_dir = base_dir.parent if str(base_dir) else None
 
@@ -1255,8 +1284,8 @@ def clear_plugin_runtime_files(config: dict[str, Any]) -> dict[str, int]:
                 ):
                     item.unlink(missing_ok=True)
                     removed["temp_files"] += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"clear runtime temp item failed: {item}, error={e}")
 
     return removed
 
