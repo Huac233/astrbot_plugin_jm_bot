@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -24,6 +25,7 @@ _COVER_DOWNLOAD_LOCKS = {}
 _COVER_LOCK_GUARD = threading.RLock()
 _COVER_CACHE_LAST_CLEAN_TS = 0.0
 _OPTION_FILE_LOCK = threading.RLock()
+_RANDOM_CACHE_LOCK = threading.RLock()
 
 
 def _plugin_data_root() -> Path:
@@ -253,8 +255,6 @@ def _enforce_max_local_albums(config: dict[str, Any]):
 
     dirs.sort(key=lambda d: d.stat().st_mtime)
     oldest = dirs[0]
-    import shutil
-
     shutil.rmtree(oldest, ignore_errors=True)
     logger.info(
         f"max_local_albums reached({max_local}), removed oldest album dir: {oldest}"
@@ -654,8 +654,6 @@ def search_album(
 def get_random_album(
     config: dict[str, Any], query: str = ""
 ) -> dict[str, Any] | None:
-    import random
-
     client = _new_client(config, impl="api")
 
     tags = re.sub(r"[，,]+", " ", query).strip() if query else ""
@@ -664,11 +662,12 @@ def get_random_album(
     cache_file.parent.mkdir(parents=True, exist_ok=True)
 
     cache_data: dict[str, Any] = {}
-    if cache_file.exists():
-        try:
-            cache_data = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
-        except Exception:
-            cache_data = {}
+    with _RANDOM_CACHE_LOCK:
+        if cache_file.exists():
+            try:
+                cache_data = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+            except Exception:
+                cache_data = {}
 
     max_page = 0
     if tags in cache_data:
@@ -699,13 +698,21 @@ def get_random_album(
             else:
                 low = mid + 1
         max_page = low
-        cache_data[tags] = {
-            "max_page": max_page,
-            "timestamp": datetime.now().isoformat(),
-        }
-        cache_file.write_text(
-            json.dumps(cache_data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with _RANDOM_CACHE_LOCK:
+            latest_cache: dict[str, Any] = {}
+            if cache_file.exists():
+                try:
+                    latest_cache = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+                except Exception:
+                    latest_cache = {}
+            latest_cache[tags] = {
+                "max_page": max_page,
+                "timestamp": datetime.now().isoformat(),
+            }
+            cache_file.write_text(
+                json.dumps(latest_cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     if max_page <= 0:
         return None

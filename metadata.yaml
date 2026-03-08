@@ -2,7 +2,7 @@ name: astrbot_plugin_jm_bot
 display_name: jm_bot
 desc: 适配 AstrBot 的 JM 漫画下载与 PDF 发送插件
 help: "命令: 搜jm [关键词] [页码] | 看jm [id或序号] | 看jm [id或序号] [章节编号/范围] | 看jm [id或序号] [章节] P[页码] | 随机jm [关键词] | jm更新域名 | jm清空域名 | jm清理缓存"
-version: v0.1.3
+version: v0.1.4
 author: Huac233
 repo: https://github.com/Huac233/astrbot_plugin_jm_bot
 support_platforms:

@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import re
+import shutil
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,7 +39,7 @@ from .utils.jm_ops import (
 
 
 @register(
-    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.3"
+    "astrbot_plugin_jm_bot", "chatgpt", "适配 AstrBot 的 JM 漫画下载插件", "v0.1.4"
 )
 class JMBot(Star):
     def __init__(self, context: Context, config: dict):
@@ -929,8 +930,6 @@ class JMBot(Star):
             if album_lock:
                 album_lock.release()
             if temp_dir:
-                import shutil
-
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
     async def _download(self, album_id: str, photo_ids: list[str] | None = None):
@@ -980,10 +979,11 @@ class JMBot(Star):
                 token, arg2 = args[0], args[1].strip()
                 try:
                     self._parse_chapter_selection_input(arg2, 999999)
+                except ValueError:
+                    pass
+                else:
                     await self._handle_select_chapters(event, token, arg2)
                     return
-                except Exception:
-                    pass
 
             if len(args) == 1:
                 await self._handle_view_album(event, args[0])

@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## v0.1.4 - 2026-03-09
+
+本次版本主要围绕 astrpluginreviewer 最后一轮建议、随机缓存并发安全修复、导包规范整理，以及版本口径同步展开。
+
+### Changed
+
+- 统一插件版本号升级为 `v0.1.4`
+- 对齐 `metadata.yaml`、`@register(...)`、README 与 CHANGELOG 的版本口径
+- 小幅整理 `jm_unified` 中两参数分支的异常处理，保留原有行为的同时减少无差别吞异常
+
+### Fixed
+
+- 修复 `get_random_album()` 在多线程并发执行时读写 `random_cache_file` 未加锁，可能导致缓存文件竞争写坏的问题
+- 修复 `utils/jm_ops.py` 中局部重复导入 `shutil` / `random` 的冗余问题
+- 修复 `main.py` 中局部重复导入 `shutil` 的问题
+
+### Quality
+
+- 再次对照 AstrBot 插件开发文档检查元数据、主类注册与运行时结构
+- 完整执行 `ruff` 并再次通过 `py_compile` 校验主代码文件
+
 ## v0.1.3 - 2026-03-09
 
 本次版本主要围绕 astrpluginreviewer 新一轮意见、AstrBot 插件开发文档对齐、搜索发送风控兼容，以及并发与缓存稳定性问题修复展开。
