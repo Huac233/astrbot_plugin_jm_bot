@@ -1,0 +1,134 @@
+{
+  "request_enabled": {
+    "description": "是否启用全局代理",
+    "type": "bool",
+    "hint": "默认 false；关闭后不注入代理到运行环境和 jm 配置",
+    "default": false
+  },
+  "request_proxies": {
+    "description": "代理设置",
+    "type": "string",
+    "hint": "示例: http://127.0.0.1:7890 或 socks5://127.0.0.1:7890",
+    "default": "http://mihomo:7890"
+  },
+  "request_timeout": {
+    "description": "请求超时秒数",
+    "type": "string",
+    "hint": "默认 15",
+    "default": "15"
+  },
+  "request_max_retries": {
+    "description": "请求重试次数",
+    "type": "string",
+    "hint": "默认 2",
+    "default": "2"
+  },
+  "output_base_dir": {
+    "description": "下载输出目录",
+    "type": "string",
+    "hint": "如 /AstrBot/data/plugin_data/astrbot_plugin_jm_bot/download",
+    "default": "/AstrBot/data/plugin_data/astrbot_plugin_jm_bot/download"
+  },
+  "output_pdf_max_pages": {
+    "description": "单个 PDF 最大页数",
+    "type": "string",
+    "hint": "默认 150，0 为不分卷",
+    "default": "150"
+  },
+  "output_jpeg_quality": {
+    "description": "图片质量",
+    "type": "string",
+    "hint": "图片质量，100为不压缩，85左右可以达到文件大小和图片质量的最佳平衡，默认 85",
+    "default": "85"
+  },
+  "output_pdf_password": {
+    "description": "PDF 密码（可空）",
+    "type": "string",
+    "hint": "为空则不加密",
+    "default": ""
+  },
+  "output_max_local_albums": {
+    "description": "本地最多保留漫画文件夹数量",
+    "type": "string",
+    "hint": "默认 5，0 为不限制；达到上限时会从旧到新删除 1 个文件夹",
+    "default": "5"
+  },
+  "output_max_local_chapters": {
+    "description": "本地最多保留章节目录数量",
+    "type": "string",
+    "hint": "默认 0，表示不额外限制；可用于进一步控制单本缓存体积",
+    "default": "0"
+  },
+  "output_cover_cache_dir": {
+    "description": "搜索封面缓存目录",
+    "type": "string",
+    "hint": "如 /AstrBot/data/plugin_data/astrbot_plugin_jm_bot/cover_cache，用于保存搜索结果封面缩略图",
+    "default": "/AstrBot/data/plugin_data/astrbot_plugin_jm_bot/cover_cache"
+  },
+  "output_cover_cache_max_files": {
+    "description": "封面缓存最大保留文件数",
+    "type": "string",
+    "hint": "默认 100，0 为不限制；超过时按最旧文件优先删除",
+    "default": "100"
+  },
+  "download_image_threads": {
+    "description": "图片下载线程数",
+    "type": "string",
+    "hint": "单章节内部的图片下载并发，默认 8，范围 1~16；机器内存紧张建议 1~2",
+    "default": "8"
+  },
+  "download_photo_threads": {
+    "description": "章节下载线程数",
+    "type": "string",
+    "hint": "整本漫画下载时的章节并发，默认 8，范围 1~8；选章节下载当前仍按串行执行更稳",
+    "default": "8"
+  },
+  "interaction_search_page_count_threads": {
+    "description": "搜索页补P数并发数",
+    "type": "string",
+    "hint": "搜索结果页为作品补总P数时的并发，默认 10，范围 1~16；越大越快，但接口压力也更高",
+    "default": "10"
+  },
+  "interaction_search_cover_threads": {
+    "description": "搜索页封面下载并发数",
+    "type": "string",
+    "hint": "搜索结果页封面缩略图下载并发，默认 10，范围 1~16；缓存未命中时该值越大越快，但会提高站点与代理压力",
+    "default": "10"
+  },
+  "interaction_chapter_detail_threads": {
+    "description": "多章节详情并发数",
+    "type": "string",
+    "hint": "看jm 选择多个章节时补章节标题和P数的并发，默认 10，范围 1~16",
+    "default": "10"
+  },
+  "features_open_random_search": {
+    "description": "开启随机搜索",
+    "type": "bool",
+    "hint": "默认 true",
+    "default": true
+  },
+  "chapter_fold_threshold": {
+    "description": "章节列表折叠阈值",
+    "type": "string",
+    "hint": "章节数超过该值时，选择提示和章节列表分开发送，默认 20，0 为始终直接发送",
+    "default": "20"
+  },
+  "interaction_max_download_images": {
+    "description": "单次最大允许下载图片数",
+    "type": "string",
+    "hint": "默认 400，超过则提示用户分批下载",
+    "default": "400"
+  },
+  "interaction_max_download_chapters": {
+    "description": "单次最大允许下载章节数",
+    "type": "string",
+    "hint": "默认 3，超过则提示用户分批发送指令",
+    "default": "3"
+  },
+  "interaction_auto_recall_seconds": {
+    "description": "文本消息自动撤回秒数",
+    "type": "string",
+    "hint": "默认 60；仅纯文本消息自动撤回，图片和 PDF 不撤回，0 为关闭",
+    "default": "60"
+  }
+}
